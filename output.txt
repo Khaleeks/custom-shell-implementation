@@ -1,0 +1,20 @@
+total 296
+-rw-r--r--@ 1 khalaasiyah  staff  17977 Sep 27 16:59 executor.c
+-rw-r--r--  1 khalaasiyah  staff   8912 Oct  3 19:59 executor.o
+-rw-r--r--@ 1 khalaasiyah  staff   1785 Sep 27 16:59 input.c
+-rw-r--r--  1 khalaasiyah  staff   3496 Oct  3 19:59 input.o
+-rw-r--r--  1 khalaasiyah  staff     24 Oct  3 19:58 input.txt
+-rw-r--r--@ 1 khalaasiyah  staff   2621 Sep 27 16:59 main.c
+-rw-r--r--  1 khalaasiyah  staff   3720 Oct  3 19:59 main.o
+-rw-r--r--@ 1 khalaasiyah  staff   3637 Sep 20 18:08 Makefile
+-rw-r--r--@ 1 khalaasiyah  staff   2998 Sep 27 16:58 memory.c
+-rw-r--r--  1 khalaasiyah  staff   3368 Oct  3 19:59 memory.o
+-rwxr-xr-x  1 khalaasiyah  staff  37368 Oct  3 19:59 myshell
+-rw-r--r--  1 khalaasiyah  staff     21 Oct  3 19:58 names.txt
+-rw-r--r--  1 khalaasiyah  staff      0 Oct  3 20:02 output.txt
+-rw-r--r--@ 1 khalaasiyah  staff   9454 Sep 27 16:59 parser.c
+-rw-r--r--  1 khalaasiyah  staff   8520 Oct  3 19:59 parser.o
+-rw-r--r--@ 1 khalaasiyah  staff    266 Sep 20 18:18 README.md
+-rw-r--r--@ 1 khalaasiyah  staff   1616 Sep 20 18:09 shell.h
+-rw-r--r--@ 1 khalaasiyah  staff   3277 Sep 27 16:58 utils.c
+-rw-r--r--  1 khalaasiyah  staff   3912 Oct  3 19:59 utils.o
