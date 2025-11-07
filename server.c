@@ -1,97 +1,105 @@
 /*
- * server.c - Network Shell Server Implementation
+ * server_multithreaded.c - Multithreaded Network Shell Server Implementation
  * 
- * This file implements a network-based shell server that allows remote clients
- * to connect via TCP/IP and execute shell commands. The server receives commands
- * over the network, executes them using the shell implementation from other files,
- * captures their output, and sends the results back to the client.
+ * This file implements a multithreaded TCP server that can handle multiple
+ * clients simultaneously. Each client connection is handled by a separate
+ * thread, allowing parallel command execution.
+ * 
  * 
  * Key Features:
- * - TCP server that listens on port 8080
- * - Handles one client at a time (sequential, not concurrent)
- * - Captures both stdout and stderr from executed commands
- * - Provides detailed logging of all operations
- * - Handles edge cases like empty output and errors gracefully
+ * - Concurrent client handling using POSIX threads (pthreads)
+ * - Thread-safe client tracking and numbering
+ * - Detailed logging with client identification (IP, port, client number)
+ * - Automatic thread cleanup using detached threads
+ * - Graceful handling of client connections and disconnections
  */
 
-#include "shell.h"           // Shell implementation (parsing, execution, etc.)
-#include <sys/socket.h>      // Socket functions: socket(), bind(), listen(), accept()
-#include <netinet/in.h>      // Internet address structures: sockaddr_in
-#include <arpa/inet.h>       // Internet operations: inet_ntoa()
+#include "shell.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <stdarg.h> 
 
 /*
  * CONFIGURATION CONSTANTS
- * 
- * These define the behavior and capacity of the server
  */
 #define PORT 8080                      // TCP port the server listens on
-#define BUFFER_SIZE 4096               // Maximum size for command output (4KB)
-#define EMPTY_RESPONSE_MARKER "\x01"  // Special marker byte sent when command produces no output
-                                       // Using \x01 (ASCII SOH - Start of Header) which is unlikely
-                                       // to appear in normal command output
+#define BUFFER_SIZE 4096               // Size of buffers for command output
+#define EMPTY_RESPONSE_MARKER "\x01"  // Special marker for commands with no output
+#define MAX_CLIENTS 100                // Maximum number of concurrent clients
+
+/*
+ * CLIENT INFORMATION STRUCTURE
+ * 
+ * This structure holds all information needed to handle a client connection
+ * in a separate thread. It's passed to each thread when created.
+ * 
+ * WHY WE NEED THIS:
+ * When we create a thread with pthread_create(), we can only pass ONE pointer
+ * as an argument. To pass multiple pieces of information (socket, IP, port, etc.),
+ * we bundle them together in this structure.
+ */
+typedef struct {
+    int socket;                       // Client's socket file descriptor
+    char ip[INET_ADDRSTRLEN];        // Client's IP address (e.g., "192.168.1.100")
+    int port;                         // Client's port number
+    int client_number;                // Sequential client number for identification
+} ClientInfo;
+
+/*
+ * GLOBAL VARIABLES FOR THREAD SAFETY
+ * 
+ * These variables are shared across ALL threads and need special protection
+ * to prevent race conditions.
+ * 
+ * WHAT IS A RACE CONDITION?
+ * Imagine two threads trying to increment global_client_counter at the same time:
+ *   Thread 1 reads: counter = 5
+ *   Thread 2 reads: counter = 5  (before Thread 1 writes back!)
+ *   Thread 1 writes: counter = 6
+ *   Thread 2 writes: counter = 6  (WRONG! Should be 7)
+ * 
+ * Mutexes (mutual exclusion locks) prevent this by ensuring only one thread
+ * can access the protected resource at a time.
+ */
+static int global_client_counter = 0;     // Counter for assigning client numbers
+static pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;  // Protects counter
+static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;   // Protects console output
 
 /**
  * ============================================================================
  * FUNCTION: capture_command_output
  * ============================================================================
  * 
- * PURPOSE:
- * This function executes a shell command pipeline and captures both its
- * standard output (stdout) and standard error (stderr) into separate buffers.
- * 
- * WHY THIS IS NEEDED:
- * Normally when you run a command, its output goes directly to the terminal.
- * For a network server, we need to capture that output so we can send it
- * back to the remote client over the network connection.
+ * Execute a command pipeline and capture its stdout and stderr output.
+ * This is identical to Phase 2, but included here for completeness.
  * 
  * HOW IT WORKS:
- * 1. Creates two pipes (one for stdout, one for stderr)
- * 2. Forks a child process to run the command
- * 3. Child redirects its output to the pipes and executes the command
- * 4. Parent reads from the pipes to capture all output
- * 5. Returns the captured output in the provided buffers
+ * 1. Create two pipes: one for stdout, one for stderr
+ * 2. Fork a child process
+ * 3. Child redirects its stdout/stderr to pipes, then executes command
+ * 4. Parent reads from pipes to capture all output
+ * 5. Parent waits for child to complete
  * 
- * PARAMETERS:
- * @param pipeline:     The parsed command(s) to execute
- * @param output_buf:   Buffer to store captured stdout (normal output)
- * @param error_buf:    Buffer to store captured stderr (error messages)
- * @param output_size:  Size of the output buffer
- * @param error_size:   Size of the error buffer
- * 
- * RETURNS:
- * 0 on success, -1 on failure
+ * @param pipeline: The parsed command(s) to execute
+ * @param output_buf: Buffer to store captured stdout
+ * @param error_buf: Buffer to store captured stderr
+ * @param output_size: Size of output buffer
+ * @param error_size: Size of error buffer
+ * @return: 0 on success, -1 on failure
  */
 int capture_command_output(Pipeline *pipeline, char *output_buf, char *error_buf, 
                           size_t output_size, size_t error_size) {
+    int stdout_pipe[2];  // Pipe for capturing stdout: [0]=read end, [1]=write end
+    int stderr_pipe[2];  // Pipe for capturing stderr: [0]=read end, [1]=write end
     
-    /*
-     * STEP 1: CREATE PIPES FOR OUTPUT CAPTURE
-     * 
-     * A pipe is a one-way communication channel with two ends:
-     * - pipe[0]: Reading end (where data comes out)
-     * - pipe[1]: Writing end (where data goes in)
-     * 
-     * We need two separate pipes:
-     * - stdout_pipe: To capture normal command output
-     * - stderr_pipe: To capture error messages
-     * 
-     * Think of pipes like tubes: you write into one end, and can read
-     * from the other end. Perfect for capturing output!
-     */
-    int stdout_pipe[2];  // Pipe for capturing stdout
-    int stderr_pipe[2];  // Pipe for capturing stderr
-    
-    /*
-     * Initialize buffers to empty strings.
-     * This ensures if nothing is captured, the buffers contain valid
-     * empty C strings rather than garbage data.
-     */
+    // Initialize buffers to empty strings
     output_buf[0] = '\0';
     error_buf[0] = '\0';
     
     /*
-     * Create both pipes. If either fails, we can't capture output,
-     * so we return an error immediately.
+     * Create the pipes. If either fails, we can't capture output.
      */
     if (pipe(stdout_pipe) == -1 || pipe(stderr_pipe) == -1) {
         perror("pipe failed");
@@ -99,24 +107,14 @@ int capture_command_output(Pipeline *pipeline, char *output_buf, char *error_buf
     }
     
     /*
-     * STEP 2: FORK A CHILD PROCESS
-     * 
-     * fork() creates an exact copy of the current process:
-     * - The child process (returns 0) will execute the command
-     * - The parent process (returns child's PID) will capture the output
-     * 
-     * Why fork? Because we need two separate processes:
-     * 1. One to run the command (and have its output redirected to pipes)
-     * 2. One to read from those pipes (can't read and write at same time)
+     * Fork a child process to execute the command.
+     * The parent will capture the child's output through the pipes.
      */
     pid_t pid = fork();
     
-    /*
-     * Error check: If fork() fails (returns -1), we're out of resources.
-     * Clean up the pipes we created and return error.
-     */
     if (pid == -1) {
         perror("fork failed");
+        // Clean up pipes on failure
         close(stdout_pipe[0]);
         close(stdout_pipe[1]);
         close(stderr_pipe[0]);
@@ -124,128 +122,66 @@ int capture_command_output(Pipeline *pipeline, char *output_buf, char *error_buf
         return -1;
     }
     
-    /*
-     * ========================================================================
-     * CHILD PROCESS EXECUTION PATH (pid == 0)
-     * ========================================================================
-     * 
-     * The child's job is simple:
-     * 1. Redirect stdout and stderr to the write ends of the pipes
-     * 2. Execute the command
-     * 3. Exit when done
-     * 
-     * After redirection, anything the command prints goes into the pipes
-     * instead of the terminal.
-     */
     if (pid == 0) {
         /*
-         * Close the reading ends of both pipes in the child.
-         * The child only needs to WRITE to the pipes, not read from them.
-         * Closing unused file descriptors is good practice and prevents
-         * pipe deadlocks.
+         * CHILD PROCESS PATH
+         * 
+         * The child's job is to:
+         * 1. Redirect stdout and stderr to the pipes
+         * 2. Execute the command
+         * 3. Exit (never returns to this code)
          */
+        
+        // Close read ends - child only writes to pipes
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
         
-        /*
-         * REDIRECT OUTPUT TO PIPES
-         * 
-         * dup2() is the key system call here. It duplicates a file descriptor,
-         * making two file descriptors point to the same file/pipe.
-         * 
-         * dup2(stdout_pipe[1], STDOUT_FILENO) means:
-         * "Make file descriptor 1 (stdout) point to the same place as
-         *  stdout_pipe[1] (the write end of the stdout pipe)"
-         * 
-         * After this, when the command does printf() or any stdout write,
-         * the data goes into the pipe instead of the terminal!
-         */
-        dup2(stdout_pipe[1], STDOUT_FILENO);  // Redirect stdout → stdout pipe
-        dup2(stderr_pipe[1], STDERR_FILENO);  // Redirect stderr → stderr pipe
+        // Redirect stdout to stdout_pipe write end
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        // Redirect stderr to stderr_pipe write end
+        dup2(stderr_pipe[1], STDERR_FILENO);
         
-        /*
-         * Close the original pipe file descriptors.
-         * After dup2(), we have duplicates at STDOUT_FILENO and STDERR_FILENO,
-         * so we don't need the originals anymore.
-         */
+        // Close original pipe file descriptors (we have duplicates now)
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
         
-        /*
-         * Execute the command pipeline.
-         * This function (from executor.c) will run the command(s).
-         * All output goes into our pipes because we redirected stdout/stderr.
-         */
+        // Execute the command - if successful, this never returns
         execute_pipeline(pipeline);
-        
-        /*
-         * Exit the child process when command completes.
-         * The child is done - no need to continue running.
-         */
         exit(EXIT_SUCCESS);
-    } 
-    /*
-     * ========================================================================
-     * PARENT PROCESS EXECUTION PATH (pid > 0)
-     * ========================================================================
-     * 
-     * The parent's job is to:
-     * 1. Read all output from the pipes
-     * 2. Store it in the provided buffers
-     * 3. Wait for the child to finish
-     * 
-     * The parent READS from the pipes while the child WRITES to them.
-     */
-    else {
+    } else {
         /*
-         * Close the writing ends of both pipes in the parent.
-         * The parent only needs to READ from the pipes, not write to them.
-         * This is crucial: if the parent leaves the write end open, the
-         * read() calls below might never see EOF!
+         * PARENT PROCESS PATH
+         * 
+         * The parent's job is to:
+         * 1. Read all output from the pipes
+         * 2. Store it in the provided buffers
+         * 3. Wait for child to complete
          */
+        
+        // Close write ends - parent only reads from pipes
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
         
         /*
-         * READ STDOUT FROM THE PIPE
-         * 
-         * We read in a loop because the command might produce more output
-         * than can be read in a single read() call. We keep reading until:
-         * - read() returns 0 (EOF - child closed the write end)
-         * - read() returns -1 (error)
-         * - We've filled our buffer
+         * Read stdout from pipe in chunks until no more data.
+         * We read in a loop because the pipe might not contain all
+         * data in a single read() call.
          */
-        ssize_t bytes_read = 0;     // Bytes read in current iteration
-        ssize_t total_read = 0;     // Total bytes read so far
+        ssize_t bytes_read = 0;
+        ssize_t total_read = 0;
         
-        /*
-         * Read loop for stdout:
-         * - read() returns the number of bytes actually read
-         * - We add to total_read to track our position in the buffer
-         * - We subtract 1 from buffer size to leave room for null terminator
-         */
         while ((bytes_read = read(stdout_pipe[0], output_buf + total_read, 
                                  output_size - total_read - 1)) > 0) {
             total_read += bytes_read;
-            
-            // Stop if buffer is almost full (leave room for null terminator)
+            // Stop if buffer is full (leave room for null terminator)
             if (total_read >= (ssize_t)output_size - 1) break;
         }
+        output_buf[total_read] = '\0';  // Null-terminate the string
         
         /*
-         * Null-terminate the output string.
-         * This makes output_buf a valid C string that can be used with
-         * string functions like strlen(), printf(), etc.
+         * Read stderr from pipe (same process as stdout)
          */
-        output_buf[total_read] = '\0';
-        
-        /*
-         * READ STDERR FROM THE PIPE
-         * 
-         * Same process as stdout, but reading from the stderr pipe.
-         * Error messages and warnings from the command end up here.
-         */
-        total_read = 0;  // Reset counter for stderr
+        total_read = 0;
         while ((bytes_read = read(stderr_pipe[0], error_buf + total_read, 
                                  error_size - total_read - 1)) > 0) {
             total_read += bytes_read;
@@ -253,84 +189,139 @@ int capture_command_output(Pipeline *pipeline, char *output_buf, char *error_buf
         }
         error_buf[total_read] = '\0';
         
-        /*
-         * Close the reading ends of the pipes.
-         * We're done reading, so close them to free up resources.
-         */
+        // Close read ends - we're done reading
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
         
         /*
-         * WAIT FOR CHILD TO COMPLETE
-         * 
-         * waitpid() blocks until the child process terminates.
-         * This is important because:
-         * 1. Prevents zombie processes (child processes that finished but
-         *    whose exit status hasn't been collected)
-         * 2. Ensures command has fully completed before we return
-         * 3. Allows us to get the exit status (though we don't use it here)
+         * Wait for child process to complete.
+         * This prevents zombie processes and ensures command finishes
+         * before we return.
          */
         int status;
         waitpid(pid, &status, 0);
     }
     
-    return 0;  // Success!
+    return 0;
 }
 
 /**
  * ============================================================================
- * FUNCTION: handle_client
+ * FUNCTION: thread_safe_printf
  * ============================================================================
  * 
- * PURPOSE:
- * This function handles all communication with a single connected client.
- * It runs in a loop, receiving commands from the client, executing them,
- * and sending back the results.
+ * Thread-safe wrapper around printf that ensures output from different
+ * threads doesn't get interleaved.
  * 
- * LIFECYCLE:
- * 1. Client connects
- * 2. Loop: Receive command → Execute → Send results
- * 3. Continue until client sends "exit" or disconnects
- * 4. Close connection
+ * WHY THIS IS NEEDED:
+ * printf() is NOT thread-safe for multi-line output. Without synchronization,
+ * when multiple threads call printf() simultaneously, their output can get
+ * mixed together:
  * 
- * WHY THE LOOP:
- * We want to handle multiple commands from the same client without requiring
- * them to reconnect each time. The loop keeps the connection alive and
- * processes commands one at a time.
+ * Thread 1: "[INFO] Client #1 connected..."
+ * Thread 2: "[INFO] Client #2 connected..."
  * 
- * PARAMETERS:
- * @param client_socket: File descriptor for the connected client's socket
+ * Without mutex, you might see:
+ * "[INFO] Client #1 [INFO] Client #2 connected...connected..."
+ * 
+ * With mutex, output is properly serialized:
+ * "[INFO] Client #1 connected..."
+ * "[INFO] Client #2 connected..."
+ * 
+ * HOW IT WORKS:
+ * 1. Lock the mutex (wait if another thread holds it)
+ * 2. Print the message
+ * 3. Flush output to ensure it appears immediately
+ * 4. Unlock the mutex (allow other threads to print)
+ * 
+ * @param format: Printf-style format string
+ * @param ...: Variable arguments for the format string
  */
-void handle_client(int client_socket) {
+void thread_safe_printf(const char *format, ...) {
+    // Lock the output mutex - only one thread can print at a time
+    pthread_mutex_lock(&output_mutex);
+    
+    // Variable argument list handling (like printf does internally)
+    va_list args;
+    va_start(args, format);       // Initialize argument list
+    vprintf(format, args);         // Print with variable arguments
+    va_end(args);                  // Clean up argument list
+    fflush(stdout);                // Force immediate output display
+    
+    // Unlock the mutex - allow other threads to print
+    pthread_mutex_unlock(&output_mutex);
+}
+
+/**
+ * ============================================================================
+ * FUNCTION: handle_client_thread
+ * ============================================================================
+ * 
+ * Thread function that handles all communication with a single client.
+ * This function runs in a separate thread for each connected client,
+ * allowing multiple clients to be served simultaneously.
+ * 
+ * THREAD LIFECYCLE:
+ * 1. Thread is created when client connects (via pthread_create)
+ * 2. Extracts client info from parameter
+ * 3. Enters command processing loop
+ * 4. Exits when client disconnects or sends "exit"
+ * 5. Thread automatically cleans up (detached mode)
+ * 
+ * IMPORTANT: This function runs concurrently with other client threads
+ * and the main server thread. Multiple copies of this function can be
+ * executing simultaneously, each handling a different client.
+ * 
+ * @param arg: Pointer to ClientInfo structure (cast from void*)
+ * @return: NULL (required by pthread function signature)
+ */
+void* handle_client_thread(void* arg) {
+    /*
+     * EXTRACT CLIENT INFORMATION
+     * 
+     * The parameter is passed as void* to match pthread requirements.
+     * We cast it back to ClientInfo* to access the client's information.
+     * 
+     * We copy all values to local variables so we can free the ClientInfo
+     * structure immediately. This prevents memory leaks.
+     */
+    ClientInfo* client = (ClientInfo*)arg;
+    int client_socket = client->socket;
+    char client_ip[INET_ADDRSTRLEN];
+    strcpy(client_ip, client->ip);
+    int client_port = client->port;
+    int client_num = client->client_number;
+    
+    /*
+     * Free the ClientInfo structure now that we've copied its contents.
+     * This structure was dynamically allocated in main() and passed to us.
+     * We're responsible for freeing it to prevent memory leaks.
+     */
+    free(client);
+    
     /*
      * DECLARE BUFFERS FOR COMMUNICATION
-     * 
-     * We need three buffers:
-     * 1. command_buffer: Stores the command received from client
-     * 2. output_buffer: Stores stdout from command execution
-     * 3. error_buffer: Stores stderr from command execution
+     * These buffers are LOCAL to this thread - each client thread has its own.
      */
-    char command_buffer[MAX_INPUT_SIZE];  // Command received from client
-    char output_buffer[BUFFER_SIZE];      // Command's stdout output
-    char error_buffer[BUFFER_SIZE];       // Command's stderr output
-    
-    printf("[INFO] Client connected.\n");
+    char command_buffer[MAX_INPUT_SIZE];  // Stores command received from client
+    char output_buffer[BUFFER_SIZE];      // Stores command's stdout output
+    char error_buffer[BUFFER_SIZE];       // Stores command's stderr output
     
     /*
      * MAIN CLIENT COMMUNICATION LOOP
      * 
-     * This loop handles the entire client session:
-     * - Receive commands from the client
-     * - Execute them
-     * - Send results back
-     * - Repeat until client disconnects or sends "exit"
+     * This loop continues until:
+     * - Client disconnects (recv returns 0 or -1)
+     * - Client sends "exit" command
+     * 
+     * Each iteration:
+     * 1. Receives a command from the client
+     * 2. Parses and validates the command
+     * 3. Executes the command and captures output
+     * 4. Sends the output back to the client
      */
     while (1) {
-        /*
-         * Clear all buffers before each iteration.
-         * memset() fills the buffer with zeros, ensuring no leftover
-         * data from previous commands remains.
-         */
+        // Clear buffers for new command
         memset(command_buffer, 0, MAX_INPUT_SIZE);
         memset(output_buffer, 0, BUFFER_SIZE);
         memset(error_buffer, 0, BUFFER_SIZE);
@@ -338,40 +329,30 @@ void handle_client(int client_socket) {
         /*
          * RECEIVE COMMAND FROM CLIENT
          * 
-         * recv() reads data from the network socket.
-         * - client_socket: Which client to read from
-         * - command_buffer: Where to store the received data
-         * - MAX_INPUT_SIZE - 1: Maximum bytes to read (leave room for \0)
-         * - 0: Flags (none in this case)
-         * 
-         * recv() returns:
-         * - Positive number: Number of bytes received
-         * - 0: Client closed the connection gracefully
-         * - Negative: Error occurred
+         * recv() blocks until data arrives or connection closes.
+         * Returns:
+         *   > 0: Number of bytes received
+         *   = 0: Client closed connection gracefully
+         *   < 0: Error occurred
          */
         ssize_t bytes_received = recv(client_socket, command_buffer, 
                                      MAX_INPUT_SIZE - 1, 0);
         
-        /*
-         * Check if client disconnected or error occurred.
-         * If recv() returns 0 or negative, the connection is broken.
-         */
         if (bytes_received <= 0) {
-            printf("[INFO] Client disconnected.\n");
-            break;  // Exit the loop, ending the client session
+            /*
+             * Client disconnected or error occurred.
+             * Either way, we exit the loop and clean up.
+             */
+            thread_safe_printf("[INFO] Client #%d disconnected.\n", client_num);
+            break;
         }
         
-        /*
-         * Null-terminate the received command.
-         * Network data isn't automatically null-terminated, so we must
-         * add \0 to make it a valid C string.
-         */
+        // Null-terminate the received string
         command_buffer[bytes_received] = '\0';
         
         /*
-         * Remove trailing newline if present.
-         * Clients might send commands with \n at the end (like pressing Enter).
-         * We remove it to clean up the command string.
+         * Remove trailing newline character if present.
+         * Many clients (like telnet) send commands with '\n' at the end.
          */
         size_t len = strlen(command_buffer);
         if (len > 0 && command_buffer[len - 1] == '\n') {
@@ -379,193 +360,201 @@ void handle_client(int client_socket) {
         }
         
         /*
-         * Log the received command for debugging/monitoring
+         * LOG RECEIVED COMMAND
+         * Format: [RECEIVED] [Client #X - IP:PORT] Received command: "cmd"
+         * 
+         * This helps with debugging and monitoring server activity.
          */
-        printf("[RECEIVED] Received command: \"%s\" from client.\n", command_buffer);
+        thread_safe_printf("[RECEIVED] [Client #%d - %s:%d] Received command: \"%s\"\n",
+                          client_num, client_ip, client_port, command_buffer);
         
         /*
          * CHECK FOR EXIT COMMAND
          * 
          * If client sends "exit", they want to disconnect.
-         * We send a termination message and break out of the loop.
+         * We send a goodbye message and exit the loop.
          */
         if (strcmp(command_buffer, "exit") == 0) {
-            printf("[INFO] Client requested exit.\n");
-            const char *exit_msg = "Shell terminated.\n";
+            thread_safe_printf("[INFO] [Client #%d - %s:%d] Client requested disconnect. "
+                             "Closing connection.\n",
+                             client_num, client_ip, client_port);
+            
+            const char *exit_msg = "Disconnected from server.\n";
             send(client_socket, exit_msg, strlen(exit_msg), 0);
-            break;  // Exit loop, client session ends
+            break;  // Exit loop and clean up
         }
         
         /*
          * SKIP EMPTY COMMANDS
          * 
-         * If the command is empty (just whitespace or nothing),
-         * there's nothing to execute. Continue to next iteration.
+         * If user just pressed Enter with no command, ignore it
+         * and wait for the next command.
          */
         if (strlen(command_buffer) == 0) {
             continue;
         }
         
-        printf("[EXECUTING] Executing command: \"%s\"\n", command_buffer);
+        /*
+         * LOG COMMAND EXECUTION START
+         * 
+         * Indicates we're about to process the command.
+         */
+        thread_safe_printf("[EXECUTING] [Client #%d - %s:%d] Executing command: \"%s\"\n",
+                          client_num, client_ip, client_port, command_buffer);
         
         /*
          * PARSE THE COMMAND
          * 
-         * parse_input() (from parser.c) converts the command string into
-         * a Pipeline structure that can be executed. It handles:
-         * - Breaking the command into tokens
-         * - Identifying pipes (|)
-         * - Parsing redirections (<, >, 2>)
+         * Convert the raw command string into a structured Pipeline object.
+         * This breaks down the command into individual components (command name,
+         * arguments, redirections, pipes, etc.).
          * 
-         * Returns NULL if parsing fails (syntax error).
+         * Returns NULL if parsing fails (e.g., syntax error).
          */
         Pipeline *pipeline = parse_input(command_buffer);
         
-        /*
-         * Check if parsing failed
-         */
         if (pipeline == NULL) {
-            const char *error = "[ERROR] Failed to parse command.\n";
-            printf("%s", error);
-            
-            // Send error message back to client
+            // Parsing failed - send error to client
             snprintf(output_buffer, BUFFER_SIZE, "Error: Failed to parse command.\n");
-            printf("[OUTPUT] Sending error message to client.\n");
+            thread_safe_printf("[ERROR] [Client #%d - %s:%d] Failed to parse command.\n",
+                             client_num, client_ip, client_port);
+            thread_safe_printf("[OUTPUT] [Client #%d - %s:%d] Sending error message to client:\n"
+                             "\"Error: Failed to parse command.\"\n",
+                             client_num, client_ip, client_port);
             send(client_socket, output_buffer, strlen(output_buffer), 0);
             continue;  // Skip to next command
         }
         
         /*
-         * VALIDATE THE PARSED PIPELINE
+         * VALIDATE THE PIPELINE
          * 
-         * validate_pipeline() (from parser.c) checks for common errors:
+         * Check for semantic errors like:
          * - Empty commands
          * - Missing redirection files
-         * - Invalid syntax
+         * - Non-existent input files
          * 
          * Returns 1 if valid, 0 if invalid.
          */
         if (!validate_pipeline(pipeline)) {
             // Validation failed - send error to client
             snprintf(output_buffer, BUFFER_SIZE, "Error: Invalid command syntax.\n");
-            printf("[OUTPUT] Sending error message to client.\n");
+            thread_safe_printf("[ERROR] [Client #%d - %s:%d] Invalid command syntax.\n",
+                             client_num, client_ip, client_port);
+            thread_safe_printf("[OUTPUT] [Client #%d - %s:%d] Sending error message to client:\n"
+                             "\"Error: Invalid command syntax.\"\n",
+                             client_num, client_ip, client_port);
             send(client_socket, output_buffer, strlen(output_buffer), 0);
-            
-            // Clean up the pipeline structure before continuing
-            free_pipeline(pipeline);
-            continue;
+            free_pipeline(pipeline);  // Clean up pipeline structure
+            continue;  // Skip to next command
         }
         
         /*
          * EXECUTE THE COMMAND AND CAPTURE OUTPUT
          * 
-         * capture_command_output() runs the command and stores:
-         * - stdout in output_buffer
-         * - stderr in error_buffer
+         * This runs the command in a child process and captures both
+         * stdout and stderr into our buffers.
          * 
          * Returns 0 on success, -1 on failure.
          */
         int exec_result = capture_command_output(pipeline, output_buffer, 
                                                 error_buffer, BUFFER_SIZE, BUFFER_SIZE);
         
-        /*
-         * Free the pipeline structure now that we're done executing.
-         * This prevents memory leaks by cleaning up all dynamically
-         * allocated memory used for the parsed command.
-         */
+        // Free pipeline structure now that we're done with it
         free_pipeline(pipeline);
         
-        /*
-         * Check if execution failed
-         */
         if (exec_result == -1) {
-            const char *error = "[ERROR] Failed to execute command.\n";
-            printf("%s", error);
+            // Execution failed - send error to client
             snprintf(output_buffer, BUFFER_SIZE, "Error: Failed to execute command.\n");
-            printf("[OUTPUT] Sending error message to client.\n");
+            thread_safe_printf("[ERROR] [Client #%d - %s:%d] Failed to execute command.\n",
+                             client_num, client_ip, client_port);
+            thread_safe_printf("[OUTPUT] [Client #%d - %s:%d] Sending error message to client:\n"
+                             "\"Error: Failed to execute command.\"\n",
+                             client_num, client_ip, client_port);
             send(client_socket, output_buffer, strlen(output_buffer), 0);
-            continue;
+            continue;  // Skip to next command
         }
         
         /*
-         * PREPARE RESPONSE TO SEND BACK TO CLIENT
+         * PREPARE AND SEND RESPONSE
          * 
-         * We need to decide what to send based on what the command produced:
-         * 1. If there's error output (stderr), send that (errors are priority)
-         * 2. If there's normal output (stdout), send that
-         * 3. If there's no output at all, send a special marker
+         * We have three cases to handle:
+         * 1. Command produced error output (send error_buffer)
+         * 2. Command produced normal output (send output_buffer)
+         * 3. Command produced no output (send special marker)
          * 
-         * The response buffer is twice the size of output_buffer to handle
-         * cases where we might want to combine both stdout and stderr.
+         * We prioritize error output over normal output if both exist.
          */
-        char response[BUFFER_SIZE * 2];
+        char response[BUFFER_SIZE * 2];  // Large buffer for response
         memset(response, 0, sizeof(response));
         
-        /*
-         * CASE 1: Command produced error output
-         * 
-         * If stderr has content, something went wrong or the command
-         * printed warnings. We prioritize sending this to the client.
-         */
         if (strlen(error_buffer) > 0) {
-            printf("[ERROR] Command produced error output:\n%s", error_buffer);
-            printf("[OUTPUT] Sending error message to client.\n");
+            /*
+             * Command produced error output (stderr).
+             * This could be an actual error or just diagnostic messages.
+             */
+            thread_safe_printf("[ERROR] [Client #%d - %s:%d] Command produced error output.\n",
+                             client_num, client_ip, client_port);
+            thread_safe_printf("[OUTPUT] [Client #%d - %s:%d] Sending error message to client:\n"
+                             "\"%s\"\n",
+                             client_num, client_ip, client_port, error_buffer);
             snprintf(response, sizeof(response), "%s", error_buffer);
-        } 
-        /*
-         * CASE 2: Command produced normal output
-         * 
-         * If stdout has content, the command executed successfully
-         * and produced output. Send this to the client.
-         */
-        else if (strlen(output_buffer) > 0) {
-            printf("[OUTPUT] Sending output to client:\n%s", output_buffer);
+        } else if (strlen(output_buffer) > 0) {
+            /*
+             * Command produced normal output (stdout).
+             * This is the typical case for successful commands.
+             */
+            thread_safe_printf("[OUTPUT] [Client #%d - %s:%d] Sending output to client:\n%s",
+                             client_num, client_ip, client_port, output_buffer);
             snprintf(response, sizeof(response), "%s", output_buffer);
-        } 
-        /*
-         * CASE 3: Command produced no output
-         * 
-         * Some commands execute successfully but produce no output
-         * (like 'mkdir newdir' or 'touch file.txt'). We need to send
-         * SOMETHING to let the client know the command completed.
-         * 
-         * We use a special marker (EMPTY_RESPONSE_MARKER) which is
-         * a non-printable character (\x01) that the client can recognize.
-         */
-        else {
-            printf("[OUTPUT] Command executed successfully with no output.\n");
+        } else {
+            /*
+             * Command executed successfully but produced no output.
+             * Examples: "touch file.txt", "mkdir directory"
+             * 
+             * We send a special marker so the client knows the command
+             * completed successfully (not an error or disconnect).
+             */
+            thread_safe_printf("[OUTPUT] [Client #%d - %s:%d] Command executed successfully "
+                             "with no output.\n",
+                             client_num, client_ip, client_port);
             snprintf(response, sizeof(response), "%s", EMPTY_RESPONSE_MARKER);
         }
         
         /*
          * SEND RESPONSE TO CLIENT
          * 
-         * send() writes data to the network socket.
-         * - client_socket: Which client to send to
-         * - response: The data to send
-         * - strlen(response): How many bytes to send
-         * - 0: Flags (none)
-         * 
-         * send() returns the number of bytes actually sent, or -1 on error.
+         * send() transmits the response over the network socket.
+         * Returns number of bytes sent, or -1 on error.
          */
         ssize_t sent = send(client_socket, response, strlen(response), 0);
         if (sent == -1) {
-            perror("Send failed");
-            break;  // Can't send to client, connection broken
+            // Send failed - probably client disconnected
+            thread_safe_printf("[ERROR] [Client #%d - %s:%d] Send failed.\n",
+                             client_num, client_ip, client_port);
+            break;  // Exit loop and clean up
         }
         
         /*
-         * Loop continues - ready to receive the next command from client
+         * Command processed successfully!
+         * Loop back to wait for the next command from this client.
          */
     }
     
     /*
-     * CLIENT SESSION ENDED
+     * CLEANUP AND EXIT THREAD
      * 
-     * Close the client socket to free up the network connection.
-     * The client has either disconnected or sent "exit".
+     * We reach here when:
+     * - Client disconnected
+     * - Client sent "exit"
+     * - A send() failed
+     * 
+     * Close the client's socket and exit the thread.
+     * Since the thread is detached, all resources are automatically cleaned up.
      */
     close(client_socket);
+    thread_safe_printf("[INFO] Client #%d disconnected.\n", client_num);
+    
+    return NULL;  // Thread exits
 }
 
 /**
@@ -573,50 +562,42 @@ void handle_client(int client_socket) {
  * FUNCTION: main
  * ============================================================================
  * 
- * PURPOSE:
- * This is the server's main function. It sets up a TCP server socket,
- * listens for incoming client connections, and handles each client
- * sequentially (one at a time).
+ * Main server function that sets up the TCP server and spawns threads
+ * to handle each connecting client.
  * 
- * SERVER LIFECYCLE:
- * 1. Create server socket
- * 2. Bind socket to port 8080
- * 3. Listen for connections
- * 4. Loop forever: Accept client → Handle client → Repeat
+ * FLOW:
+ * 1. Create and configure server socket
+ * 2. Bind socket to address and port
+ * 3. Start listening for connections
+ * 4. Loop forever:
+ *    a. Accept new client connection (blocks until client connects)
+ *    b. Create ClientInfo structure with client details
+ *    c. Spawn new thread to handle the client
+ *    d. Detach thread for automatic cleanup
+ *    e. Go back to step 4a (accept next client)
  * 
- * NETWORK CONCEPTS:
- * - Socket: An endpoint for network communication (like a telephone)
- * - Bind: Associate the socket with a specific port number
- * - Listen: Tell OS to accept incoming connections on this socket
- * - Accept: Wait for a client to connect, return a new socket for that client
+ * KEY DIFFERENCES FROM SEQUENTIAL SERVER (PHASE 2):
+ * - Uses pthread_create() to spawn a new thread for each client
+ * - Threads are detached for automatic cleanup
+ * - Main thread continues accepting new connections immediately
+ * - Multiple clients can be served simultaneously
+ * - Each client gets independent execution in its own thread
  */
 int main(void) {
-    /*
-     * DECLARE SOCKET VARIABLES
-     * 
-     * - server_socket: The listening socket that accepts new connections
-     * - client_socket: A socket for communicating with a connected client
-     * - server_addr: Structure holding server's address info (IP, port)
-     * - client_addr: Structure holding client's address info
-     * - client_addr_len: Size of client address structure
-     */
     int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
+    pthread_t thread_id;  // Will hold thread ID for each new thread
     
     /*
-     * STEP 1: CREATE THE SERVER SOCKET
+     * CREATE SERVER SOCKET
      * 
-     * socket() creates a new socket (endpoint for communication).
+     * socket() creates an endpoint for communication.
+     * AF_INET: IPv4 address family
+     * SOCK_STREAM: TCP (reliable, connection-oriented)
+     * 0: Let system choose appropriate protocol (TCP for SOCK_STREAM)
      * 
-     * Parameters:
-     * - AF_INET: Use IPv4 addresses (like 192.168.1.1)
-     * - SOCK_STREAM: Use TCP (reliable, ordered, connection-based)
-     * - 0: Let OS choose the appropriate protocol (TCP for SOCK_STREAM)
-     * 
-     * Returns: File descriptor for the socket, or -1 on error
-     * 
-     * Think of this like getting a phone line installed in your building.
+     * Returns file descriptor for the socket, or -1 on error.
      */
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == -1) {
@@ -625,21 +606,13 @@ int main(void) {
     }
     
     /*
-     * STEP 2: SET SOCKET OPTIONS
+     * SET SOCKET OPTIONS
      * 
-     * SO_REUSEADDR allows the server to restart immediately even if
-     * the port is in a "TIME_WAIT" state from a previous run.
+     * SO_REUSEADDR allows the server to immediately reuse the port
+     * after a restart, without waiting for the OS timeout period.
      * 
-     * Without this, if you stop and quickly restart the server, you might
-     * get "Address already in use" error because the OS hasn't fully
-     * released the port yet.
-     * 
-     * Parameters to setsockopt():
-     * - server_socket: Which socket to configure
-     * - SOL_SOCKET: Socket-level option (not protocol-specific)
-     * - SO_REUSEADDR: The specific option to set
-     * - &opt: Pointer to the option value (1 = enable)
-     * - sizeof(opt): Size of the option value
+     * Without this, you'd get "Address already in use" errors when
+     * restarting the server quickly.
      */
     int opt = 1;
     if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
@@ -649,35 +622,29 @@ int main(void) {
     }
     
     /*
-     * STEP 3: CONFIGURE SERVER ADDRESS
+     * CONFIGURE SERVER ADDRESS
      * 
-     * The sockaddr_in structure tells the OS what address and port
-     * we want to bind our server to.
+     * Set up the address structure that defines where the server listens:
+     * - sin_family: IPv4
+     * - sin_addr: INADDR_ANY (listen on all network interfaces)
+     * - sin_port: PORT (8080), converted to network byte order with htons()
      * 
-     * Think of this like writing your building's address on the phone line.
+     * htons() converts "host to network short" - ensures proper byte order
+     * regardless of system architecture (big-endian vs little-endian).
      */
-    memset(&server_addr, 0, sizeof(server_addr));  // Zero out the structure
-    
-    server_addr.sin_family = AF_INET;              // Use IPv4
-    server_addr.sin_addr.s_addr = INADDR_ANY;      // Accept connections on any network interface
-                                                     // (0.0.0.0 - listen on all IPs of this machine)
+    memset(&server_addr, 0, sizeof(server_addr));  // Zero out structure
+    server_addr.sin_family = AF_INET;              // IPv4
+    server_addr.sin_addr.s_addr = INADDR_ANY;      // Any interface (0.0.0.0)
     server_addr.sin_port = htons(PORT);            // Port 8080
-                                                     // htons() converts from host byte order to
-                                                     // network byte order (handles endianness)
     
     /*
-     * STEP 4: BIND SOCKET TO ADDRESS
+     * BIND SOCKET TO ADDRESS
      * 
-     * bind() associates the socket with the address and port.
-     * After binding, the OS knows that network traffic for port 8080
-     * should be directed to this socket.
+     * bind() associates the socket with a specific IP address and port.
+     * After this, the socket is "named" and ready to accept connections
+     * on that address/port combination.
      * 
-     * Parameters:
-     * - server_socket: The socket to bind
-     * - (struct sockaddr *)&server_addr: Address to bind to (cast to generic sockaddr)
-     * - sizeof(server_addr): Size of the address structure
-     * 
-     * Think of this like officially registering your phone number.
+     * This is like claiming "port 8080 is mine" from the OS.
      */
     if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
         perror("Bind failed");
@@ -686,96 +653,186 @@ int main(void) {
     }
     
     /*
-     * STEP 5: START LISTENING FOR CONNECTIONS
+     * START LISTENING FOR CONNECTIONS
      * 
-     * listen() marks the socket as passive - it will be used to accept
-     * incoming connections rather than initiate them.
+     * listen() marks the socket as passive - ready to accept incoming
+     * connection requests.
      * 
-     * Parameters:
-     * - server_socket: The socket to listen on
-     * - 5: Backlog - maximum number of pending connections to queue
-     *      If 5 clients try to connect simultaneously, they'll all succeed
-     *      (queued). The 6th client will fail or have to wait.
-     * 
-     * Think of this like turning on your phone and waiting for calls.
+     * MAX_CLIENTS is the backlog - maximum number of pending connections
+     * that can queue up while we're busy accepting others.
      */
-    if (listen(server_socket, 5) == -1) {
+    if (listen(server_socket, MAX_CLIENTS) == -1) {
         perror("Listen failed");
         close(server_socket);
         exit(EXIT_FAILURE);
     }
     
-    /*
-     * Server is now ready! Print status messages.
-     */
     printf("[INFO] Server started, waiting for client connections...\n");
-    printf("[INFO] Server listening on port %d\n", PORT);
     
     /*
-     * STEP 6: MAIN SERVER LOOP - ACCEPT AND HANDLE CLIENTS
+     * MAIN SERVER LOOP - ACCEPT CLIENTS AND SPAWN THREADS
      * 
-     * This infinite loop is the heart of the server:
-     * 1. Wait for a client to connect (blocking call)
-     * 2. Handle that client's session
-     * 3. When client disconnects, go back to step 1
+     * This loop runs forever, accepting new client connections and
+     * spawning a thread to handle each one.
      * 
-     * This is a simple sequential server - it handles one client at a time.
-     * A production server would typically use threads or fork() to handle
-     * multiple clients simultaneously.
+     * The beauty of this design: the main thread is ALWAYS available
+     * to accept new clients, no matter how many clients are currently
+     * connected or what they're doing.
      */
     while (1) {
         /*
-         * accept() waits for a client to connect.
+         * ACCEPT NEW CLIENT CONNECTION
          * 
-         * This is a BLOCKING call - the program stops here until a client
-         * connects. When a client connects:
-         * - Returns a new socket (client_socket) for talking to that client
-         * - Fills in client_addr with the client's address information
+         * accept() blocks (waits) until a client connects.
+         * When a client connects:
+         * - Returns a NEW socket for communicating with that client
+         * - Fills client_addr with the client's IP address and port
          * 
-         * Parameters:
-         * - server_socket: The listening socket
-         * - (struct sockaddr *)&client_addr: Where to store client's address
-         * - &client_addr_len: Size of the address structure
-         * 
-         * Returns: New socket for the client connection, or -1 on error
-         * 
-         * Think of this like answering the phone when it rings.
+         * The original server_socket remains listening for more connections.
+         * The new client_socket is specifically for this one client.
          */
         client_socket = accept(server_socket, (struct sockaddr *)&client_addr, 
                              &client_addr_len);
         
-        /*
-         * Check if accept() failed.
-         * If it did, log the error but continue - don't shut down the
-         * entire server just because one accept() call failed.
-         */
         if (client_socket == -1) {
             perror("Accept failed");
-            continue;  // Go back to top of loop, wait for next client
+            continue;  // Skip this client, keep accepting others
         }
         
         /*
-         * HANDLE THE CLIENT
+         * ALLOCATE AND POPULATE CLIENT INFO STRUCTURE
          * 
-         * handle_client() takes over here. It will:
-         * - Receive commands from the client
-         * - Execute them
-         * - Send results back
-         * - Continue until client disconnects
+         * We create a ClientInfo structure on the heap (using malloc)
+         * because it needs to survive after we pass it to the thread.
          * 
-         * When handle_client() returns, the client has disconnected,
-         * and we loop back to accept() to wait for the next client.
+         * The thread will be responsible for freeing this memory.
+         * 
+         * WHY HEAP, NOT STACK?
+         * If we used a stack variable, it would be destroyed when this
+         * loop iteration ends, but the thread might not have read it yet!
          */
-        handle_client(client_socket);
+        ClientInfo* client_info = malloc(sizeof(ClientInfo));
+        if (client_info == NULL) {
+            perror("malloc failed");
+            close(client_socket);
+            continue;  // Skip this client
+        }
+        
+        // Store client's socket
+        client_info->socket = client_socket;
+        
+        // Convert client's IP from binary to string format
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_info->ip, INET_ADDRSTRLEN);
+        
+        // Convert client's port from network byte order to host byte order
+        client_info->port = ntohs(client_addr.sin_port);
         
         /*
-         * Loop repeats - ready for the next client connection
+         * ASSIGN CLIENT NUMBER (THREAD-SAFE)
+         * 
+         * We need to assign a unique number to each client for logging.
+         * Since multiple threads could be accepting clients simultaneously
+         * in a more advanced design, we use a mutex to protect the counter.
+         * 
+         * CRITICAL SECTION (protected by mutex):
+         * 1. Lock mutex
+         * 2. Increment counter
+         * 3. Assign number to this client
+         * 4. Unlock mutex
+         * 
+         * This ensures no two clients get the same number.
+         */
+        pthread_mutex_lock(&counter_mutex);
+        global_client_counter++;
+        client_info->client_number = global_client_counter;
+        pthread_mutex_unlock(&counter_mutex);
+        
+        /*
+         * LOG CLIENT CONNECTION
+         * 
+         * Announce that a new client has connected and which thread
+         * will handle them.
+         */
+        thread_safe_printf("[INFO] Client #%d connected from %s:%d. Assigned to Thread-%d.\n",
+                          client_info->client_number, client_info->ip, 
+                          client_info->port, client_info->client_number);
+        
+        /*
+         * CREATE NEW THREAD TO HANDLE CLIENT
+         * 
+         * pthread_create() spawns a new thread that starts executing
+         * the handle_client_thread() function.
+         * 
+         * Parameters:
+         * - &thread_id: Where to store the new thread's ID
+         * - NULL: Default thread attributes (standard stack size, etc.)
+         * - handle_client_thread: Function the new thread will execute
+         * - client_info: Argument passed to the thread function (void*)
+         * 
+         * The new thread starts running immediately and independently.
+         * This function returns immediately, allowing us to accept
+         * the next client without waiting for this one to finish.
+         * 
+         * THREAD INDEPENDENCE:
+         * Once created, the thread runs independently. Even if this
+         * main thread is busy accepting another client, the spawned
+         * thread continues processing its client's commands.
+         */
+        if (pthread_create(&thread_id, NULL, handle_client_thread, client_info) != 0) {
+            perror("Thread creation failed");
+            free(client_info);  // Clean up since thread wasn't created
+            close(client_socket);
+            continue;  // Skip this client, keep accepting others
+        }
+        
+        /*
+         * DETACH THE THREAD
+         * 
+         * pthread_detach() tells the system: "I don't care about this
+         * thread's return value, so automatically clean up all its
+         * resources when it exits."
+         * 
+         * WITHOUT DETACHING:
+         * - Thread resources aren't freed until we call pthread_join()
+         * - We'd need to track all thread IDs and join them later
+         * - This would be complex and unnecessary for a server
+         * 
+         * WITH DETACHING:
+         * - Thread resources are automatically freed when thread exits
+         * - We don't need to track thread IDs
+         * - Perfect for "fire and forget" worker threads
+         * 
+         * ANALOGY:
+         * Think of a detached thread like hiring a contractor for a job.
+         * You don't need to supervise them or wait for them to finish -
+         * they do their work independently and clean up when done.
+         */
+        pthread_detach(thread_id);
+        
+        /*
+         * Main thread immediately loops back to accept() to handle next client.
+         * The spawned thread handles the current client independently.
+         * 
+         * This is what makes the server "multithreaded" - we can accept
+         * new clients while other threads are busy serving existing clients.
+         * 
+         * CONCURRENCY IN ACTION:
+         * At this point in the code, multiple things are happening:
+         * - This main thread goes back to accept() to wait for next client
+         * - Thread 1 might be executing a "ls" command for Client #1
+         * - Thread 2 might be waiting for Client #2 to type a command
+         * - Thread 3 might be sending output back to Client #3
+         * 
+         * All happening simultaneously!
          */
     }
     
     /*
-     * This line is never reached (infinite loop above), but if it were,
-     * we'd close the server socket to clean up.
+     * CLEANUP
+     * 
+     * We never actually reach this code because the while(1) loop
+     * runs forever. But if we did (e.g., if we added a shutdown signal),
+     * we'd close the server socket here.
      */
     close(server_socket);
     return 0;

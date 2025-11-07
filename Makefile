@@ -1,79 +1,70 @@
-# Makefile for Remote Shell (Phase 2)
-# Compiles both server and client programs with Phase 1 shell functionality
-
+# Makefile for Phase 3 - Multithreaded Shell Server
+# Compiler and flags
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -std=c99 -D_POSIX_C_SOURCE=200809L
-LDFLAGS = 
+CFLAGS = -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -pthread
+LDFLAGS = -pthread
 
-# Object files for the shell core (Phase 1 functionality)
-SHELL_OBJS = executor.o parser.o memory.o utils.o
+# Target executables
+SERVER = server
+CLIENT = client
 
-# Server executable and its specific objects
-SERVER_TARGET = server
-SERVER_OBJS = server.o $(SHELL_OBJS)
+# Source files
+SERVER_SOURCES = server.c parser.c executor.c memory.c utils.c
+CLIENT_SOURCES = client.c
 
-# Client executable (standalone, no shell dependencies)
-CLIENT_TARGET = client
-CLIENT_OBJS = client.o
+# Object files
+SERVER_OBJECTS = $(SERVER_SOURCES:.c=.o)
+CLIENT_OBJECTS = $(CLIENT_SOURCES:.c=.o)
 
-# Default target: build both server and client
-all: $(SERVER_TARGET) $(CLIENT_TARGET)
+# Header files
+HEADERS = shell.h
+
+# Default target - build both server and client
+all: $(SERVER) $(CLIENT)
 
 # Build server executable
-$(SERVER_TARGET): $(SERVER_OBJS)
-	$(CC) $(CFLAGS) -o $(SERVER_TARGET) $(SERVER_OBJS) $(LDFLAGS)
-	@echo "Server built successfully!"
+$(SERVER): $(SERVER_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^
+	@echo "Server compiled successfully!"
 
 # Build client executable
-$(CLIENT_TARGET): $(CLIENT_OBJS)
-	$(CC) $(CFLAGS) -o $(CLIENT_TARGET) $(CLIENT_OBJS) $(LDFLAGS)
-	@echo "Client built successfully!"
+$(CLIENT): $(CLIENT_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^
+	@echo "Client compiled successfully!"
 
-# Compile server.c
-server.o: server.c shell.h
-	$(CC) $(CFLAGS) -c server.c
+# Compile source files to object files
+%.o: %.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# Compile client.c
-client.o: client.c
-	$(CC) $(CFLAGS) -c client.c
-
-# Compile executor.c (Phase 1)
-executor.o: executor.c shell.h
-	$(CC) $(CFLAGS) -c executor.c
-
-# Compile parser.c (Phase 1)
-parser.o: parser.c shell.h
-	$(CC) $(CFLAGS) -c parser.c
-
-# Compile memory.c (Phase 1)
-memory.o: memory.c shell.h
-	$(CC) $(CFLAGS) -c memory.c
-
-# Compile utils.c (Phase 1)
-utils.o: utils.c shell.h
-	$(CC) $(CFLAGS) -c utils.c
-
-# Clean all build artifacts
+# Clean build artifacts
 clean:
-	rm -f $(SERVER_OBJS) $(CLIENT_OBJS) $(SERVER_TARGET) $(CLIENT_TARGET)
+	rm -f $(SERVER) $(CLIENT) *.o
 	@echo "Cleaned build artifacts."
 
-# Rebuild everything from scratch
+# Clean and rebuild
 rebuild: clean all
 
-# Help target to show available commands
-help:
-	@echo "Available targets:"
-	@echo "  all      - Build both server and client (default)"
-	@echo "  server   - Build only the server"
-	@echo "  client   - Build only the client"
-	@echo "  clean    - Remove all build artifacts"
-	@echo "  rebuild  - Clean and rebuild everything"
-	@echo "  help     - Show this help message"
-	@echo ""
-	@echo "Usage:"
-	@echo "  make           # Build both programs"
-	@echo "  make clean     # Clean build files"
-	@echo "  make rebuild   # Clean and rebuild"
+# Run server
+run-server: $(SERVER)
+	./$(SERVER)
 
-.PHONY: all clean rebuild help
+# Run client (use: make run-client IP=<ip_address>)
+run-client: $(CLIENT)
+	./$(CLIENT) $(IP)
+
+# Help target
+help:
+	@echo "Makefile for Phase 3 - Multithreaded Shell Server"
+	@echo ""
+	@echo "Available targets:"
+	@echo "  all          - Build both server and client (default)"
+	@echo "  server       - Build only the server"
+	@echo "  client       - Build only the client"
+	@echo "  clean        - Remove all build artifacts"
+	@echo "  rebuild      - Clean and rebuild everything"
+	@echo "  run-server   - Build and run the server"
+	@echo "  run-client   - Build and run the client"
+	@echo "                 Usage: make run-client IP=127.0.0.1"
+	@echo "  help         - Display this help message"
+
+.PHONY: all clean rebuild run-server run-client help
